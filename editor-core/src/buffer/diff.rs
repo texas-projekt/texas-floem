@@ -2,12 +2,14 @@ use std::{
     borrow::Cow,
     ops::Range,
     sync::{
-        atomic::{self, AtomicU64},
+        atomic::{self, AtomicBool, AtomicU64},
         Arc,
     },
 };
 
 use lapce_xi_rope::Rope;
+
+const MAX_DIFF_MATRIX_CELLS: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffResult<T> {
@@ -81,6 +83,31 @@ pub fn rope_diff(
     atomic_rev: Arc<AtomicU64>,
     context_lines: Option<usize>,
 ) -> Option<Vec<DiffLines>> {
+    rope_diff_cancellable(
+        left_rope,
+        right_rope,
+        rev,
+        atomic_rev,
+        Arc::new(AtomicBool::new(false)),
+        context_lines,
+    )
+}
+
+pub fn rope_diff_cancellable(
+    left_rope: Rope,
+    right_rope: Rope,
+    rev: u64,
+    atomic_rev: Arc<AtomicU64>,
+    cancelled: Arc<AtomicBool>,
+    context_lines: Option<usize>,
+) -> Option<Vec<DiffLines>> {
+    let is_cancelled = || {
+        cancelled.load(atomic::Ordering::Acquire)
+            || atomic_rev.load(atomic::Ordering::Acquire) != rev
+    };
+    if is_cancelled() {
+        return None;
+    }
     let left_lines = left_rope.lines(..).collect::<Vec<Cow<str>>>();
     let right_lines = right_rope.lines(..).collect::<Vec<Cow<str>>>();
 
@@ -104,6 +131,39 @@ pub fn rope_diff(
     let left_diff_size = left_count - leading_equals - trailing_equals;
     let right_diff_size = right_count - leading_equals - trailing_equals;
 
+    let cells = (left_diff_size + 1).checked_mul(right_diff_size + 1);
+    if cells.is_none_or(|cells| cells > MAX_DIFF_MATRIX_CELLS) {
+        let mut changes = Vec::with_capacity(4);
+        if leading_equals > 0 {
+            changes.push(DiffLines::Both(DiffBothInfo {
+                left: 0..leading_equals,
+                right: 0..leading_equals,
+                skip: None,
+            }));
+        }
+        if left_diff_size > 0 {
+            changes.push(DiffLines::Left(
+                leading_equals..leading_equals + left_diff_size,
+            ));
+        }
+        if right_diff_size > 0 {
+            changes.push(DiffLines::Right(
+                leading_equals..leading_equals + right_diff_size,
+            ));
+        }
+        if trailing_equals > 0 {
+            changes.push(DiffLines::Both(DiffBothInfo {
+                left: left_count - trailing_equals..left_count,
+                right: right_count - trailing_equals..right_count,
+                skip: None,
+            }));
+        }
+        if is_cancelled() {
+            return None;
+        }
+        return Some(changes);
+    }
+
     let table: Vec<Vec<u32>> = {
         let mut table = vec![vec![0; right_diff_size + 1]; left_diff_size + 1];
         let left_skip = left_lines.iter().skip(leading_equals).take(left_diff_size);
@@ -114,7 +174,7 @@ pub fn rope_diff(
 
         for (i, l) in left_skip.enumerate() {
             for (j, r) in right_skip.clone().enumerate() {
-                if atomic_rev.load(atomic::Ordering::Acquire) != rev {
+                if is_cancelled() {
                     return None;
                 }
                 table[i + 1][j + 1] = if l == r {
@@ -136,7 +196,7 @@ pub fn rope_diff(
         let mut ri = right_lines.iter().skip(trailing_equals);
 
         loop {
-            if atomic_rev.load(atomic::Ordering::Acquire) != rev {
+            if is_cancelled() {
                 return None;
             }
             if j > 0 && (i == 0 || table[i][j] == table[i][j - 1]) {
@@ -171,7 +231,7 @@ pub fn rope_diff(
     right_line += leading_equals;
 
     for diff in diff.iter().rev() {
-        if atomic_rev.load(atomic::Ordering::Acquire) != rev {
+        if is_cancelled() {
             return None;
         }
         match diff {
@@ -218,7 +278,7 @@ pub fn rope_diff(
         if !changes.is_empty() {
             let changes_last = changes.len() - 1;
             for (i, change) in changes.iter_mut().enumerate() {
-                if atomic_rev.load(atomic::Ordering::Acquire) != rev {
+                if is_cancelled() {
                     return None;
                 }
                 if let DiffLines::Both(info) = change {
@@ -239,4 +299,47 @@ pub fn rope_diff(
     }
 
     Some(changes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    use super::{rope_diff_cancellable, DiffLines};
+    use lapce_xi_rope::Rope;
+
+    #[test]
+    fn oversized_diff_uses_coarse_ranges_and_preserves_context() {
+        let left = format!("header\n{}footer", "left\n".repeat(2048));
+        let right = format!("header\n{}footer", "right\n".repeat(2048));
+        let revision = std::sync::Arc::new(AtomicU64::new(7));
+        let changes = rope_diff_cancellable(
+            Rope::from(left),
+            Rope::from(right),
+            7,
+            revision,
+            std::sync::Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(changes.first(), Some(DiffLines::Both(_))));
+        assert!(matches!(changes.get(1), Some(DiffLines::Left(_))));
+        assert!(matches!(changes.get(2), Some(DiffLines::Right(_))));
+        assert!(matches!(changes.last(), Some(DiffLines::Both(_))));
+    }
+
+    #[test]
+    fn cancelled_diff_returns_none() {
+        let cancelled = std::sync::Arc::new(AtomicBool::new(true));
+        let changes = rope_diff_cancellable(
+            Rope::from("left"),
+            Rope::from("right"),
+            1,
+            std::sync::Arc::new(AtomicU64::new(1)),
+            cancelled,
+            None,
+        );
+        assert!(changes.is_none());
+    }
 }
