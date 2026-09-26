@@ -342,4 +342,62 @@ mod tests {
         );
         assert!(changes.is_none());
     }
+
+    #[test]
+    fn very_large_diff_stays_within_the_coarse_path() {
+        let left = format!("head\n{}tail", "left payload\n".repeat(100_000));
+        let right = format!("head\n{}tail", "right payload\n".repeat(100_000));
+        let changes = rope_diff_cancellable(
+            Rope::from(left),
+            Rope::from(right),
+            3,
+            std::sync::Arc::new(AtomicU64::new(3)),
+            std::sync::Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(changes.first(), Some(DiffLines::Both(_))));
+        assert!(matches!(changes.get(1), Some(DiffLines::Left(_))));
+        assert!(matches!(changes.get(2), Some(DiffLines::Right(_))));
+        assert!(matches!(changes.last(), Some(DiffLines::Both(_))));
+    }
+
+    #[test]
+    fn cancellation_interrupts_an_in_progress_matrix_diff() {
+        use std::{sync::Barrier, thread, time::Duration};
+
+        let line_count = 1_900;
+        let left = Rope::from(
+            (0..line_count)
+                .map(|line| format!("left-{line}\n"))
+                .collect::<String>(),
+        );
+        let right = Rope::from(
+            (0..line_count)
+                .map(|line| format!("right-{line}\n"))
+                .collect::<String>(),
+        );
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let barrier = std::sync::Arc::new(Barrier::new(2));
+        let cancel_flag = cancelled.clone();
+        let cancel_barrier = barrier.clone();
+        let cancel_thread = thread::spawn(move || {
+            cancel_barrier.wait();
+            thread::sleep(Duration::from_millis(10));
+            cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        barrier.wait();
+        let result = rope_diff_cancellable(
+            left,
+            right,
+            5,
+            std::sync::Arc::new(AtomicU64::new(5)),
+            cancelled,
+            None,
+        );
+        cancel_thread.join().unwrap();
+        assert!(result.is_none());
+    }
 }
